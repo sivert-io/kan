@@ -56,32 +56,60 @@ RUN --mount=type=cache,id=pnpm,target=~/.pnpm-store pnpm install --frozen-lockfi
 COPY --from=pruner /app/out/full/ .
 
 # Use provided APP_VERSION or auto-generated from pruner stage
+# Enable standalone output for minimal Docker image size
 RUN VERSION="${APP_VERSION:-$(cat /tmp/AUTO_VERSION 2>/dev/null | tr -d '\n\r' || echo 'unknown')}" && \
-    NEXT_PUBLIC_APP_VERSION="$VERSION" pnpm build --filter=${PROJECT}
-
-# # Copy static files to standalone directory
-# RUN mkdir -p apps/web/.next/standalone/.next && \
-# mv apps/web/public apps/web/.next/standalone/ && \
-# mv apps/web/.next/static apps/web/.next/standalone/.next/
+    NEXT_PUBLIC_APP_VERSION="$VERSION" \
+    NEXT_PUBLIC_USE_STANDALONE_OUTPUT="true" \
+    pnpm build --filter=${PROJECT}
 
 # 4. Final image - runner stage to run the application
-FROM base AS runner
+FROM node:${NODE_VERSION}-alpine AS runner
 ARG APP_DIRNAME
- 
+
 # Don't run production as root
-RUN addgroup --system --gid 1001 nodejs
-RUN adduser --system --uid 1001 nextjs
-USER nextjs
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser --system --uid 1001 nextjs
 
 WORKDIR /app
 
 ENV NODE_ENV=production
+ENV NEXT_PUBLIC_USE_STANDALONE_OUTPUT=true
 
-COPY --chown=nextjs:nodejs --from=builder /app/ ./
+# Copy standalone output from builder
+# Next.js standalone output includes only production dependencies
+COPY --from=builder --chown=nextjs:nodejs /app/apps/${APP_DIRNAME}/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/apps/${APP_DIRNAME}/.next/static ./apps/${APP_DIRNAME}/.next/static
+COPY --from=builder --chown=nextjs:nodejs /app/apps/${APP_DIRNAME}/public ./apps/${APP_DIRNAME}/public
+
+# Install drizzle-kit globally for migrations
+# Using --omit=dev and --no-audit to reduce size and speed up install
+RUN npm install -g drizzle-kit@^0.28.1 --omit=dev --no-audit && \
+    npm cache clean --force && \
+    rm -rf /tmp/* /var/cache/apk/* ~/.npm
+
+# Copy minimal files needed for migrations
+# Only copy schema directory (not entire src) - drizzle-kit only needs schema files
+COPY --from=builder --chown=nextjs:nodejs /app/packages/db/migrations ./packages/db/migrations
+COPY --from=builder --chown=nextjs:nodejs /app/packages/db/drizzle.config.ts ./packages/db/drizzle.config.ts
+COPY --from=builder --chown=nextjs:nodejs /app/packages/db/tsconfig.json ./packages/db/tsconfig.json
+COPY --from=builder --chown=nextjs:nodejs /app/packages/db/package.json ./packages/db/package.json
+# Copy only schema directory (drizzle.config.ts points to ./src/schema)
+# Maintain directory structure: src/schema
+COPY --from=builder --chown=nextjs:nodejs /app/packages/db/src/schema ./packages/db/src/schema
+
+# Copy entrypoint script for migrations and startup
+COPY --from=builder --chown=nextjs:nodejs /app/apps/${APP_DIRNAME}/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh && \
+    # Clean up any unnecessary files
+    find /app -name "*.map" -delete 2>/dev/null || true && \
+    find /app -name ".DS_Store" -delete 2>/dev/null || true
+
+USER nextjs
+
 WORKDIR /app/apps/${APP_DIRNAME}
 
 ARG PORT=3000
 ENV PORT=${PORT}
 EXPOSE ${PORT}
 
-CMD ["sh", "-c", "if [ -n \"$POSTGRES_URL\" ]; then cd /app && pnpm db:migrate && cd /app/apps/web; fi && pnpm start"]
+CMD ["/app/entrypoint.sh"]
